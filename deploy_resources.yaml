@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  CloudFormation template to create a Lambda function for processing Nitro Enclave logs.
+  The function analyzes logs, generates a CSV summary, uploads it to S3, and sends SNS notifications.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configuration Parameters"
+        Parameters:
+          - BucketName
+          - SNSTopicArn
+          - Weeks
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store the CSV summary file
+    AllowedPattern: "[a-zA-Z0-9-]+"
+    ConstraintDescription: Bucket name can include numbers, lowercase letters, uppercase letters, and hyphens.
+
+  SNSTopicArn:
+    Type: String
+    Description: ARN of the SNS topic for notifications
+    AllowedPattern: "arn:aws:sns:[a-z0-9-]+:[0-9]{12}:[a-zA-Z0-9-_]+"
+    ConstraintDescription: Must be a valid SNS topic ARN
+
+  Weeks:
+    Type: Number
+    Description: Number of weeks to look back for log analysis
+    Default: 4
+    MinValue: 1
+    MaxValue: 52
+    ConstraintDescription: Value must be between 1 and 52 weeks
+
+Resources:
+  EnclaveLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EnclaveLogsProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub ${EnclaveLogsBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/nitro/enclave:*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EnclaveLogsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import re
+          import boto3
+          import time
+          import csv
+          import os
+          from datetime import datetime, timedelta
+
+          def calculate_time_difference(start_time, end_time):
+              if start_time and end_time:
+                  start_dt = datetime.strptime(start_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                  end_dt = datetime.strptime(end_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                  return str(end_dt - start_dt)
+              return None
+
+          def capture_pids(log_lines):
+              pids = {}
+              for line in log_lines:
+                  pid_match = re.search(r'Enclave process PID: (\d+)', line)
+                  if pid_match:
+                      pid = pid_match.group(1)
+                      if pid not in pids:
+                          pids[pid] = {'lines': [], 'run_args': None, 'eid_time': None, 'eid': None, 'termination_time': None}
+                      pids[pid]['lines'].append(line.strip())
+                  
+                  run_args_match = re.search(r'Run args = (.+)', line)
+                  if run_args_match and pid:
+                      pids[pid]['run_args'] = run_args_match.group(1)
+              return pids
+
+          def capture_enclave_ids(log_lines, pids):
+              eid_to_encid = {}
+              for pid, data in pids.items():
+                  for line in log_lines:
+                      if f'[enc-xxxxxxx:{pid}]' in line:
+                          data['lines'].append(line.strip())
+                          
+                          eid_match = re.search(r'Enclave ID = (i-[\w-]+-enc[\w-]+)', line)
+                          if eid_match:
+                              eid = eid_match.group(1)
+                              if eid not in eid_to_encid:
+                                  encid_match = re.search(r'i-[\w-]+-enc([\w-]+)', eid)
+                                  if encid_match:
+                                      encid = encid_match.group(1)
+                                      eid_to_encid[eid] = encid
+                                      time_match = re.search(r'\[([\d]{4}-[\d]{2}-[\d]{2}T[\d]{2}:[\d]{2}:[\d]{2}\.[\d]{3}Z)\]', line)
+                                      if time_match:
+                                          data['eid_time'] = time_match.group(1)
+                                      data['eid'] = eid
+              return eid_to_encid
+
+          def capture_termination_times(log_lines, pids):
+              for line in log_lines:
+                  termination_match = re.search(r'Enclave has completed termination.', line)
+                  if termination_match:
+                      time_match = re.search(r'\[([\d]{4}-[\d]{2}-[\d]{2}T[\d]{2}:[\d]{2}:[\d]{2}\.[\d]{3}Z)\]', line)
+                      if time_match:
+                          termination_time = time_match.group(1)
+                          pid_match = re.search(r'\[enc-([\w-]+):(\d+)\]', line)
+                          if pid_match:
+                              encid = pid_match.group(1)
+                              pid = pid_match.group(2)
+                              if pid in pids:
+                                  pids[pid]['termination_time'] = termination_time
+
+          def write_summary_to_csv(pids, file_path):
+              with open(file_path, 'w', newline='', encoding='utf-8') as csvfile:
+                  fieldnames = ['PID', 'Instance ID', 'Enclave ID', 'Run args', 'Enclave Start time', 'Enclave terminated at', 'Time difference']
+                  writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                  writer.writeheader()
+                  for pid, data in pids.items():
+                      if data['run_args'] or data['eid_time'] or data['eid'] or data['termination_time']:
+                          time_diff = calculate_time_difference(data['eid_time'], data['termination_time'])
+                          instance_id = data['eid'].split('-enc')[0] if data['eid'] else ''
+                          writer.writerow({
+                              'PID': pid,
+                              'Instance ID': instance_id,
+                              'Enclave ID': data['eid'],
+                              'Run args': data['run_args'],
+                              'Enclave Start time': data['eid_time'],
+                              'Enclave terminated at': data['termination_time'],
+                              'Time difference': time_diff
+                          })
+
+          def query_cloudwatch_logs(log_group_name, query_string, start_time, end_time):
+              client = boto3.client('logs')
+              start_query_response = client.start_query(
+                  logGroupName=log_group_name,
+                  startTime=int(start_time.timestamp()),
+                  endTime=int(end_time.timestamp()),
+                  queryString=query_string,
+              )
+
+              query_id = start_query_response['queryId']
+              response = None
+
+              while response is None or response['status'] == 'Running':
+                  time.sleep(1)  # Sleep for 1 second before checking the query status again
+                  response = client.get_query_results(queryId=query_id)
+
+              return response['results']
+
+          def upload_to_s3(file_path, bucket_name, object_name):
+              s3_client = boto3.client('s3')
+              s3_client.upload_file(file_path, bucket_name, object_name)
+
+          def generate_presigned_url(bucket_name, object_name, expiration=3600):
+              s3_client = boto3.client('s3')
+              response = s3_client.generate_presigned_url('get_object',
+                                                          Params={'Bucket': bucket_name, 'Key': object_name},
+                                                          ExpiresIn=expiration)
+              return response
+
+          def send_sns_message(topic_arn, message):
+              sns_client = boto3.client('sns')
+              sns_client.publish(TopicArn=topic_arn, Message=message)
+
+          def lambda_handler(event, context):
+              log_group_name = '/aws/nitro/enclave'
+              query_string = """
+              fields @message
+              | sort @timestamp desc
+              | limit 10000
+              """
+              weeks = int(os.environ['Weeks'])
+              start_time = datetime.utcnow() - timedelta(weeks=weeks)
+              end_time = datetime.utcnow()
+
+              query_results = query_cloudwatch_logs(log_group_name, query_string, start_time, end_time)
+              log_lines = [result[0]['value'] for result in query_results if result[0]['field'] == '@message']
+
+              pids = capture_pids(log_lines)
+              capture_enclave_ids(log_lines, pids)
+              capture_termination_times(log_lines, pids)
+
+              file_path = '/tmp/enclave_summary.csv'
+              write_summary_to_csv(pids, file_path)
+
+              bucket_name = os.environ['BucketName']
+              object_name = 'enclave_summary.csv'
+              upload_to_s3(file_path, bucket_name, object_name)
+
+              presigned_url = generate_presigned_url(bucket_name, object_name)
+
+              sns_topic_arn = os.environ['SNSTopicArn']
+              message = (
+                  f"Enclave info is uploaded to CSV file for the last {weeks} weeks. "
+                  f"You can download it using the following link: {presigned_url}\n\n"
+                  f"If the pre-signed URL is expired, you can access the file directly from the S3 bucket:\n"
+                  f"Bucket: {bucket_name}\n"
+                  f"Object: {object_name}"
+              )
+              send_sns_message(sns_topic_arn, message)
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Enclave info has been processed and uploaded to S3. SNS notification sent.'
+              }
+      Runtime: python3.8
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          BucketName: !Ref BucketName
+          SNSTopicArn: !Ref SNSTopicArn
+          Weeks: !Ref Weeks
+      Tags:
+        - Key: Purpose
+          Value: NitroEnclaveLogsProcessing
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the created Lambda function
+    Value: !GetAtt EnclaveLogsLambda.Arn
+
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref EnclaveLogsLambda
+
+  S3BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref EnclaveLogsBucket
+
+  S3BucketArn:
+    Description: ARN of the created S3 bucket
+    Value: !GetAtt EnclaveLogsBucket.Arn
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref SNSTopicArn
