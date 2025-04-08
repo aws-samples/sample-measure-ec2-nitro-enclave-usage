@@ -9,17 +9,10 @@ Metadata:
       - Label:
           default: "Configuration Parameters"
         Parameters:
-          - BucketName
           - SNSTopicArn
           - Weeks
 
 Parameters:
-  BucketName:
-    Type: String
-    Description: Name of the S3 bucket to store the CSV summary file
-    AllowedPattern: "[a-zA-Z0-9-]+"
-    ConstraintDescription: Bucket name can include numbers, lowercase letters, uppercase letters, and hyphens.
-
   SNSTopicArn:
     Type: String
     Description: ARN of the SNS topic for notifications
@@ -38,7 +31,7 @@ Resources:
   EnclaveLogsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Ref BucketName
+      BucketName: !Sub 'measure-nitro-enclaves--${AWS::Region}-${AWS::AccountId}'
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -253,7 +246,7 @@ Resources:
       ReservedConcurrentExecutions: 1
       Environment:
         Variables:
-          BucketName: !Ref BucketName
+          BucketName: !Ref EnclaveLogsBucket
           SNSTopicArn: !Ref SNSTopicArn
           Weeks: !Ref Weeks
       Tags:
